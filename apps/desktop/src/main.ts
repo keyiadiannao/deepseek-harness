@@ -59,6 +59,7 @@ import { DesktopBrowserGuests } from './browser-guests.ts'
 import { installDesktopShortcuts } from './keyboard.ts'
 import { DesktopUpdateOverlays } from './update-overlay.ts'
 import { DesktopQuitConfirmation } from './quit-confirmation.ts'
+import { consumeRestartHandoff, DESKTOP_RESTART_ID_ENV, DESKTOP_RESTART_PROTOCOL_ENV, DESKTOP_RESTART_PROTOCOL_VERSION, restartHandoffPath, writeRestartHandoff } from './restart-handoff.ts'
 import { DesktopTray } from './tray.ts'
 import { DesktopBackgroundNotice } from './background-notice.ts'
 
@@ -91,6 +92,31 @@ function currentDesktopLocale(): ReturnType<typeof resolveDesktopLocale> {
 function quitWithoutConfirmation(): void {
   skipQuitConfirmation = true
   app.quit()
+}
+
+/** Whether this shell has already handed itself to `app.relaunch()`; a second call would start a second app. */
+let relaunchRequested = false
+
+/**
+ * Record a Host-requested restart and let Electron perform it.
+ *
+ * One relaunch per shell. The Host stops as part of quitting, and because the shell is
+ * the one stopping it, that exit is not a crash — the recovery dialog never sees it.
+ * @param restartId - identity the Host assigned to this restart.
+ */
+function requestApplicationRestart(restartId: string): void {
+  if (relaunchRequested) return
+  try {
+    writeRestartHandoff(restartHandoffPath(app.getPath('userData')), restartId)
+  } catch (error) {
+    // The respawned Host proves itself with this record; without it a restart would
+    // come up unclaimable, so the application keeps running instead.
+    console.error('desktop restart: could not record the handoff', error)
+    return
+  }
+  relaunchRequested = true
+  app.relaunch()
+  quitWithoutConfirmation()
 }
 const recovery = new DesktopFatalRecovery({
   messages: () => currentDesktopLocale().messages,
@@ -339,6 +365,9 @@ async function main(): Promise<void> {
   })
   let hostEnvironment: NodeJS.ProcessEnv = process.env
   const prepareHostEnvironment = async (): Promise<void> => { hostEnvironment = await loginShell }
+  // A restart requested before this launch: `app.relaunch()` passes neither arguments
+  // nor environment, so the identity was recorded on disk and is taken exactly once.
+  const previousRestartId = consumeRestartHandoff(restartHandoffPath(app.getPath('userData')))
   let quitting = false
   let startup: Promise<void> | undefined
   let workspaceRecovery: Promise<void> | undefined
@@ -445,9 +474,17 @@ async function main(): Promise<void> {
   const backend = new DesktopBackendController((onFailure) => {
     const hostInspectPort = developmentHostInspectPort(development)
     const host = new DesktopHostProcess(resources.node, resources.dsh, activeProject,
-      hostInspectPort, { ...hostEnvironment, DSH_CLIENT_VERSION: desktopClientVersion() }, onFailure,
+      hostInspectPort, {
+        ...hostEnvironment,
+        DSH_CLIENT_VERSION: desktopClientVersion(),
+        // Advertised on every launch, not only after a restart: a plugin decides from
+        // this value whether the shell can own the relaunch at all.
+        [DESKTOP_RESTART_PROTOCOL_ENV]: String(DESKTOP_RESTART_PROTOCOL_VERSION),
+        ...(previousRestartId === undefined ? {} : { [DESKTOP_RESTART_ID_ENV]: previousRestartId }),
+      }, onFailure,
       primaryRuntime,
-      resources, (next) => { platformView.setSession(next) })
+      resources, (next) => { platformView.setSession(next) },
+      (restartId) => { requestApplicationRestart(restartId) })
     return {
       start: async () => {
         const ready = await host.start()

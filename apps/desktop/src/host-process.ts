@@ -23,18 +23,32 @@ interface PlatformSessionEvent {
   readonly session: PlatformSession | null
 }
 
-type DesktopHostEvent = ReadyEvent | FatalEvent | PlatformSessionEvent | { readonly type: 'shutdown-complete' } | {
-  readonly type: 'update-tasks'
-  readonly requestId: number
-  readonly active: boolean
-  readonly error?: string
-} | {
-  readonly type: 'quit-inspection'
-  readonly requestId: number
-  readonly activeTasks: boolean
-  readonly scheduledTasks: boolean
-  readonly error?: string
+/**
+ * The Host asks the shell to restart the application.
+ *
+ * Only the shell can perform this: the Host is its child, so stopping the Host and
+ * letting the shell relaunch is the only restart that leaves one application and one
+ * Host. The identity travels with the request so the respawned Host can prove it is
+ * the successor this request produced.
+ */
+interface RestartRequestedEvent {
+  readonly type: 'desktop-restart-requested'
+  readonly restartId: string
 }
+
+type DesktopHostEvent = ReadyEvent | FatalEvent | PlatformSessionEvent | RestartRequestedEvent
+  | { readonly type: 'shutdown-complete' } | {
+    readonly type: 'update-tasks'
+    readonly requestId: number
+    readonly active: boolean
+    readonly error?: string
+  } | {
+    readonly type: 'quit-inspection'
+    readonly requestId: number
+    readonly activeTasks: boolean
+    readonly scheduledTasks: boolean
+    readonly error?: string
+  }
 
 /** Correlated answer to one shell control request. */
 type DesktopHostControlResponse = Extract<DesktopHostEvent, { readonly requestId: number }>
@@ -56,6 +70,8 @@ function isDesktopHostEvent(message: unknown): message is DesktopHostEvent {
   switch (candidate.type) {
     case 'shutdown-complete':
       return true
+    case 'desktop-restart-requested':
+      return typeof candidate.restartId === 'string' && candidate.restartId.length > 0
     case 'ready':
       return typeof candidate.url === 'string'
     case 'platform-session': {
@@ -148,6 +164,8 @@ export class DesktopHostProcess {
   private failureReported = false
   private stopping = false
   private shutdownCompleted = false
+  /** The restart the Host asked for; set at most once, and only while the shell runs. */
+  private restartRequest: string | undefined
   private nextControlId = 1
   private readonly controlRequests = new Map<number, {
     resolve: (response: DesktopHostControlResponse) => void
@@ -177,6 +195,12 @@ export class DesktopHostProcess {
     private readonly packageManager?: { readonly pnpm: string; readonly nodeBin: string },
 
     private readonly onPlatformSession?: (session: PlatformSession | null) => void,
+
+    /**
+     * Receives a restart request from the Host. The shell owns the relaunch, so this
+     * callback is where it records the handoff and calls `app.relaunch()` exactly once.
+     */
+    private readonly onRestartRequested?: (restartId: string) => void,
   ) {}
 
   /**
@@ -211,6 +235,16 @@ export class DesktopHostProcess {
       }
       if (message.type === 'ready') this.readyResolve({ url: message.url, injections: message.injections })
       else if (message.type === 'platform-session') this.onPlatformSession?.(message.session)
+      else if (message.type === 'desktop-restart-requested') {
+        // Once, and only before the shell has started stopping this Host: a repeated
+        // request would relaunch a second application over the first.
+        if (this.restartRequest === undefined && !this.stopping) {
+          this.restartRequest = message.restartId
+          this.onRestartRequested?.(message.restartId)
+        } else if (this.restartRequest !== message.restartId) {
+          this.fail(new Error('dsh desktop host requested a restart the shell did not ask for'))
+        }
+      }
       else if (message.type === 'shutdown-complete') {
         if (this.stopping) this.shutdownCompleted = true
         else this.fail(new Error('dsh desktop host acknowledged an unrequested shutdown'))
